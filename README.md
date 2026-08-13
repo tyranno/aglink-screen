@@ -8,6 +8,51 @@ LLM 에이전트가 Windows 화면(UIA/Win32/GDI)을 직접 조작하게 해주�
 teleclaude 본체("대화 감독" — 라우팅/스케줄러/텔레그램)는 이 실행파일을 자식
 프로세스로 호출만 하고, 실제 화면 조작 로직은 여기 전부 들어있다.
 
+## 빠른 시작 (일반 MCP 클라이언트)
+
+**Windows 전용.** 어떤 MCP 클라이언트(Claude Code CLI, Claude Desktop, Cursor 등)에든
+stdio MCP 서버로 등록해서 씁니다.
+
+1. **바이너리 준비** — [Releases](https://github.com/tyranno/aglink-screen/releases)에서
+   `aglink-screen.exe`를 받거나, 소스에서 빌드:
+   ```powershell
+   go build -o aglink-screen.exe .
+   ```
+
+2. **MCP 서버로 등록** — 실행 파일을 `mcp` 인자로 띄우면 stdio MCP 서버가 됩니다
+   (`mcp`가 기본값이라 인자를 생략해도 됨).
+   - **Claude Code CLI**
+     ```powershell
+     claude mcp add screen -- "C:\path\to\aglink-screen.exe" mcp
+     ```
+   - **Claude Desktop / 일반 MCP 클라이언트** — 설정의 `mcpServers`에 추가:
+     ```json
+     {
+       "mcpServers": {
+         "screen": {
+           "command": "C:\\path\\to\\aglink-screen.exe",
+           "args": ["mcp"]
+         }
+       }
+     }
+     ```
+
+3. **(선택) 관리자 권한** — "관리자 권한으로 실행"된 앱을 클릭/입력하려면(Windows UIPI)
+   MCP 클라이언트 자체를 관리자 권한으로 실행해야 합니다.
+
+### 사용법
+등록 후 에이전트에게 자연어로 시키면 됩니다:
+```
+메모장 열어서 "안녕"이라고 쓰고 저장해줘
+지금 열려있는 창 목록 보여줘
+계산기에서 12 곱하기 34 눌러줘
+```
+에이전트는 먼저 `snapshot`(UIA 요소 트리)으로 화면을 읽고, 좌표 없이
+`invoke`/`set_value`/`click_control`로 조작합니다. 창 내용은 `get_text`/`get_value`로
+읽고, 스크린샷(비전)은 최후 수단입니다.
+
+---
+
 - **UIA 우선** — `snapshot`/`invoke`/`set_value`/`get_value`로 대부분의 네이티브 앱을 좌표 없이 조작
 - **Win32 자식창 폴백** — `win_controls`/`click_control`, UIA가 비어도 정확한 좌표 확보
 - **GDI 캡처** — `screenshot`/`capture_window`/`capture_region`, 비전 다운스케일을 피해 정확한 좌표 매핑

@@ -45,6 +45,7 @@ const (
 	// Control pattern IDs.
 	uiaInvokePatternId         = 10000
 	uiaValuePatternId          = 10002
+	uiaTextPatternId           = 10014
 	uiaTogglePatternId         = 10015
 	uiaSelectionItemPatternId  = 10010
 	uiaExpandCollapsePatternId = 10005
@@ -94,6 +95,13 @@ const (
 	togglePatternToggle  = 3 // Toggle()
 	selectionItemSelect  = 3 // Select()
 	expandCollapseExpand = 3 // Expand()
+
+	// IUIAutomationTextPattern: get_DocumentRange returns a TextRange spanning the
+	// whole control; IUIAutomationTextRange.GetText(maxLength, *BSTR) reads it.
+	// This is how Documents / read-only text areas / editors expose their content
+	// (they have no Value pattern), so it's the read path for "what does this say".
+	textPatternGetDocumentRange = 7  // get_DocumentRange(out **IUIAutomationTextRange)
+	textRangeGetText            = 12 // GetText(int maxLength, out *BSTR)
 )
 
 // controlTypeName maps a UIA control-type id to a short readable label.
@@ -370,7 +378,30 @@ type uiaNode struct {
 	enabled  bool
 	invoke   bool
 	value    bool
+	text     bool   // exposes the Text pattern (Document/read-only text area)
+	preview  string // short inlined content preview (see snapshotPreviewChars)
 	depth    int
+}
+
+// snapshotPreviewChars bounds the per-element content preview inlined into a
+// snapshot line. Short on purpose: enough to see WHAT a field/editor holds
+// without a screenshot or a get_value round-trip, but small so it can't bloat the
+// tree — the full content is one get_value/get_text call away.
+const snapshotPreviewChars = 120
+
+// onelinePreview flattens a value/text preview to a single trimmed line capped at
+// max runes (with an ellipsis), so an inlined snapshot preview stays one grep-able
+// line no matter how the source wraps.
+func onelinePreview(s string, max int) string {
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\t", " ")
+	s = strings.Join(strings.Fields(s), " ") // collapse runs of whitespace
+	r := []rune(s)
+	if len(r) > max {
+		return string(r[:max]) + "…"
+	}
+	return s
 }
 
 // uiaSnapshot walks the foreground window's element subtree (children-first,
@@ -457,10 +488,27 @@ func uiaSnapshot(maxElems int) (string, error) {
 			enabled := elemInt32(el, elemGetCurrentIsEnabled) != 0
 			canInvoke := elemSupportsPattern(el, uiaInvokePatternId)
 			canValue := elemSupportsPattern(el, uiaValuePatternId)
+			canText := elemSupportsPattern(el, uiaTextPatternId)
+			// Inline a short content preview so one snapshot shows structure AND
+			// content — the model can read a form's field values / an editor's text
+			// without a screenshot or a get_value per field. Value first (edit/combo),
+			// then Text (documents/read-only areas). Bounded hard; full content is a
+			// get_value/get_text away. Read before release(el).
+			preview := ""
+			if canValue {
+				if s, ok := elemValue(el); ok {
+					preview = s
+				}
+			}
+			if preview == "" && canText {
+				if s, ok := elemText(el, snapshotPreviewChars*2); ok {
+					preview = s
+				}
+			}
 			release(el)
 
-			// Skip wholly anonymous, non-interactive nodes to save tokens.
-			if strings.TrimSpace(name) == "" && autoId == "" && !canInvoke && !canValue {
+			// Skip wholly anonymous, non-interactive, contentless nodes to save tokens.
+			if strings.TrimSpace(name) == "" && autoId == "" && !canInvoke && !canValue && !canText {
 				continue
 			}
 			nodes = append(nodes, uiaNode{
@@ -470,6 +518,8 @@ func uiaSnapshot(maxElems int) (string, error) {
 				enabled:  enabled,
 				invoke:   canInvoke,
 				value:    canValue,
+				text:     canText,
+				preview:  onelinePreview(preview, snapshotPreviewChars),
 			})
 		}
 
@@ -491,6 +541,9 @@ func uiaSnapshot(maxElems int) (string, error) {
 			if nd.value {
 				caps += " [editable]"
 			}
+			if nd.text {
+				caps += " [text]"
+			}
 			if !nd.enabled {
 				caps += " [disabled]"
 			}
@@ -503,6 +556,9 @@ func uiaSnapshot(maxElems int) (string, error) {
 				fmt.Fprintf(&b, " | id=%s", nd.autoId)
 			}
 			b.WriteString(caps)
+			if nd.preview != "" {
+				fmt.Fprintf(&b, " = %q", nd.preview)
+			}
 			b.WriteString("\n")
 		}
 		if truncated {
@@ -715,6 +771,63 @@ func valueCapable(el *ole.IUnknown) bool {
 	return elemSupportsPattern(el, uiaValuePatternId)
 }
 
+// textCapable reports whether el exposes the UIA Text pattern — how Documents,
+// read-only text areas and editors expose their content (they carry no Value
+// pattern). Lets us read "what does this say" by handle instead of a screenshot.
+func textCapable(el *ole.IUnknown) bool {
+	return elemSupportsPattern(el, uiaTextPatternId)
+}
+
+// elemValue reads el's Value-pattern current text (the editable content of
+// edit/combo controls). Returns ("", false) when el has no Value pattern.
+func elemValue(el *ole.IUnknown) (string, bool) {
+	p := getPattern(el, uiaValuePatternId)
+	if p == nil {
+		return "", false
+	}
+	defer release(p)
+	var bstr *uint16
+	if hr := vcall(p, valuePatternCurrentValue, uintptr(unsafe.Pointer(&bstr))); failed(hr) {
+		return "", false
+	}
+	if bstr == nil {
+		return "", true
+	}
+	s := ole.BstrToString(bstr)
+	ole.SysFreeString((*int16)(unsafe.Pointer(bstr)))
+	return s, true
+}
+
+// elemText reads el's content via the Text pattern's document range, truncated
+// server-side to maxLen chars (pass a bounded value — never unbounded, so a huge
+// document can't return megabytes). Returns ("", false) when el has no Text
+// pattern, so callers can fall back to the Value pattern.
+func elemText(el *ole.IUnknown, maxLen int) (string, bool) {
+	tp := getPattern(el, uiaTextPatternId)
+	if tp == nil {
+		return "", false
+	}
+	defer release(tp)
+	var rng *ole.IUnknown
+	if hr := vcall(tp, textPatternGetDocumentRange, uintptr(unsafe.Pointer(&rng))); failed(hr) || rng == nil {
+		return "", false
+	}
+	defer release(rng)
+	if maxLen <= 0 {
+		maxLen = 1
+	}
+	var bstr *uint16
+	if hr := vcall(rng, textRangeGetText, uintptr(int32(maxLen)), uintptr(unsafe.Pointer(&bstr))); failed(hr) {
+		return "", false
+	}
+	if bstr == nil {
+		return "", true
+	}
+	s := ole.BstrToString(bstr)
+	ole.SysFreeString((*int16)(unsafe.Pointer(bstr)))
+	return s, true
+}
+
 // uiaInvoke finds an element by Name (or AutomationId) and activates it via the
 // most appropriate pattern (Invoke → SelectionItem → Toggle → ExpandCollapse).
 func uiaInvoke(name string) error {
@@ -831,7 +944,11 @@ func uiaGetValue(name string) (string, error) {
 		}
 		defer release(root)
 
-		el, err := findByNamePreferring(uia, root, name, valueCapable)
+		// Prefer a same-named element that actually carries readable text (a label
+		// and its edit box often share a caption; we want the one with content).
+		el, err := findByNamePreferring(uia, root, name, func(e *ole.IUnknown) bool {
+			return valueCapable(e) || textCapable(e)
+		})
 		if err != nil {
 			return "", err
 		}
@@ -840,23 +957,93 @@ func uiaGetValue(name string) (string, error) {
 		}
 		defer release(el)
 
-		p := getPattern(el, uiaValuePatternId)
-		if p == nil {
-			return "", fmt.Errorf("element %q does not support the Value pattern", name)
+		if s, ok := elemValue(el); ok {
+			return clampFieldValue(s), nil
 		}
-		defer release(p)
-
-		var bstr *uint16
-		if hr := vcall(p, valuePatternCurrentValue, uintptr(unsafe.Pointer(&bstr))); failed(hr) {
-			return "", fmt.Errorf("get_CurrentValue failed (hr=0x%x)", uint32(hr))
+		// Documents / read-only text areas expose content via the Text pattern, not
+		// Value — fall back so get_value reads them too instead of erroring out and
+		// pushing the caller to a screenshot.
+		if s, ok := elemText(el, maxFieldValueChars); ok {
+			return clampFieldValue(s), nil
 		}
-		if bstr == nil {
-			return "", nil
-		}
-		s := ole.BstrToString(bstr)
-		ole.SysFreeString((*int16)(unsafe.Pointer(bstr)))
-		return s, nil
+		return "", fmt.Errorf("element %q supports neither the Value nor Text pattern (nothing to read; try get_text or snapshot)", name)
 	})
+}
+
+// ---- get_text ----
+
+// maxTextChars bounds get_text. Larger than a single field's value cap because
+// reading a document/editor pane is the whole point — but still bounded so a huge
+// document can't flood the prompt (the caller can re-read with a named sub-element
+// or capture_region if it truly needs more).
+const maxTextChars = 8000
+
+// clampTextValue trims get_text output to maxTextChars runes with a marker, a
+// belt-and-suspenders bound on top of the server-side GetText truncation.
+func clampTextValue(s string) string {
+	r := []rune(s)
+	if len(r) <= maxTextChars {
+		return s
+	}
+	return string(r[:maxTextChars]) + fmt.Sprintf("… [truncated, %d chars total]", len(r))
+}
+
+// uiaGetText reads a control's full textual content via the UIA Text pattern
+// (with a Value-pattern fallback) so a worker can read documents, editors and
+// read-only text panes BY HANDLE instead of screenshotting them. name is an
+// element Name/AutomationId; an empty name targets the foreground window element
+// itself (useful when the whole window is one text document). A pure read — no
+// synthetic input.
+func uiaGetText(name string) (string, error) {
+	return uiaDo(func(uia *ole.IUnknown) (string, error) {
+		root, err := foregroundElement(uia)
+		if err != nil {
+			return "", err
+		}
+		defer release(root)
+
+		target := root
+		if strings.TrimSpace(name) != "" {
+			found, ferr := findByNamePreferring(uia, root, name, func(e *ole.IUnknown) bool {
+				return textCapable(e) || valueCapable(e)
+			})
+			if ferr != nil {
+				return "", ferr
+			}
+			if found == nil {
+				return "", fmt.Errorf("no element named %q (try snapshot)", name)
+			}
+			defer release(found)
+			target = found
+		}
+
+		if s, ok := elemText(target, maxTextChars); ok {
+			return clampTextValue(s), nil
+		}
+		if s, ok := elemValue(target); ok {
+			return clampTextValue(s), nil
+		}
+		if strings.TrimSpace(name) == "" {
+			return "", fmt.Errorf("the foreground window exposes no Text pattern at its root; name a specific element from snapshot, or use capture_window as a last resort")
+		}
+		return "", fmt.Errorf("element %q supports neither the Text nor Value pattern", name)
+	})
+}
+
+// maxFieldValueChars bounds a single UIA field value returned by get_value. The
+// element COUNT is already capped (snapshot max=200), but a single control — a
+// text editor, a document, a huge read-only box — could return its entire
+// contents (tens of thousands of tokens) in one read. This is the missing
+// per-element length cap; the value is trimmed with a marker so the caller knows
+// it was cut.
+const maxFieldValueChars = 2000
+
+func clampFieldValue(s string) string {
+	r := []rune(s)
+	if len(r) <= maxFieldValueChars {
+		return s
+	}
+	return string(r[:maxFieldValueChars]) + fmt.Sprintf("… [truncated, %d chars total]", len(r))
 }
 
 // ---- wait_for_control ----

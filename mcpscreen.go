@@ -8,11 +8,53 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
+
+// defaultScreenshotLongEdge is the fallback cap (in px) for the longer edge of a
+// full `screenshot`, chosen to bound per-screenshot vision-token cost. Claude's
+// vision downscales anything over ~1568px on the long edge before tokenizing, so an
+// uncapped 1080p/4K/multi-monitor grab all cost roughly the same; capping to 1280
+// cuts that meaningfully with no practical readability loss. Callers can still
+// request full resolution with scale=1.0. Clicking is unaffected — coordinates
+// come from win_controls/snapshot.
+const defaultScreenshotLongEdge = 1280
+
+// visionLongEdgeCap is the long edge (px) past which Claude's vision downscales an
+// image before tokenizing. Pixels beyond it cost no extra vision tokens — they only
+// inflate the PNG on the wire and, worse, in the stored transcript, which is replayed
+// to the API on every later request. So capture_window/capture_region cap themselves
+// here by default instead of returning the raw grab (measured: window captures came
+// back 1758x1026 and the vision layer downscaled them to ~1568x915 regardless).
+//
+// A capped image no longer maps 1:1 to screen pixels, so its caption drops the
+// click(left+ix) promise. That promise was already unreliable above this cap for the
+// same reason — the model was reading vision-downscaled pixels while being told they
+// were raw screen pixels. Callers who genuinely need the raw grab pass scale=1.0.
+const visionLongEdgeCap = 1568
+
+// maxScreenshotLongEdge is the active cap, overridable via AGLINK_SCREENSHOT_MAX_EDGE
+// (the host sets it from screen_control.max_screenshot_long_edge). A lower value
+// trades on-screen text legibility for fewer vision tokens per screenshot. Read once
+// at process start; the host spawns a fresh screen MCP process per worker turn, so a
+// config change takes effect on the next turn. Clamped so a stray value can't yield a
+// 1px or absurdly large grab.
+var maxScreenshotLongEdge = resolveScreenshotLongEdge()
+
+// resolveScreenshotLongEdge reads the env override, falling back to the default when
+// unset or out of the sane [320, 4096] range.
+func resolveScreenshotLongEdge() int {
+	if v := os.Getenv("AGLINK_SCREENSHOT_MAX_EDGE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 320 && n <= 4096 {
+			return n
+		}
+	}
+	return defaultScreenshotLongEdge
+}
 
 // controlCompleteMiddleware wraps every tool handler so that a tool call which
 // actually drove the screen is followed by the green "control complete" notice.
@@ -42,6 +84,22 @@ func controlCompleteMiddleware(next server.ToolHandlerFunc) server.ToolHandlerFu
 // This is the Windows implementation. Tools start with list_windows and
 // focus_window (more added in later tasks: snapshot/screenshot/click/...).
 func RunMCPScreen() error {
+	// Best-effort safety net: if the worker's turn ends (stdio closes, this
+	// process is about to exit) without the LLM ever calling return_desktop,
+	// switch back to the desktop the user was on before any cross-desktop
+	// focus/capture happened. No-op if no switch occurred. This must not be
+	// the ONLY mechanism (the LLM should still call return_desktop once it is
+	// done driving the other-desktop window, so the user isn't stranded there
+	// mid-turn) but it guarantees the user is never left parked on a desktop
+	// they didn't choose just because the model forgot the explicit call.
+	defer func() {
+		if msg, err := returnToOriginDesktop(); err != nil {
+			fmt.Fprintf(os.Stderr, "aglink-screen: warning: return_desktop on exit failed: %v\n", err)
+		} else if msg != "" {
+			fmt.Fprintf(os.Stderr, "aglink-screen: %s\n", msg)
+		}
+	}()
+
 	s := server.NewMCPServer(
 		"screen",
 		"0.1.0",
@@ -151,7 +209,7 @@ func RunMCPScreen() error {
 	// snapshot-polling loop.
 	s.AddTool(
 		mcp.NewTool("wait_for_control",
-			mcp.WithDescription("Block until an element (by Name or AutomationId, as reported by snapshot) appears in the foreground window's UI Automation tree, instead of calling snapshot in a manual polling loop. Fails with a timeout error after 'timeout_ms' (default 8000) if it never appears. Caveat: this checks tree EXISTENCE, not visual visibility — some apps (e.g. modern WinUI/XAML flyouts like Notepad's Find bar) keep an element mounted-but-hidden after it's been shown once, so a second wait for the same element can return immediately even though it isn't currently on screen. Confirmed reliable for an element's first-ever appearance."),
+			mcp.WithDescription("Block until an element (by Name or AutomationId from snapshot) appears in the foreground window's UIA tree; times out after 'timeout_ms' (default 8000). Checks tree existence, not visual visibility, so a re-shown WinUI/XAML flyout may return immediately."),
 			mcp.WithString("name", mcp.Description("The element Name or AutomationId to wait for."), mcp.Required()),
 			mcp.WithNumber("timeout_ms", mcp.Description("Max time to wait in milliseconds (default 8000).")),
 		),
@@ -265,7 +323,7 @@ func RunMCPScreen() error {
 	// new one) — ambiguous alt+f4 targeting has caused real data loss.
 	s.AddTool(
 		mcp.NewTool("close_window",
-			mcp.WithDescription("Close a specific window by title substring or hwnd (sends WM_CLOSE — the same signal its own X button sends, so the app's own \"save changes?\" prompt still fires normally; use confirm_dialogs right after if you want that handled automatically). Prefer this over key(\"alt+f4\") whenever you know the target window: alt+f4 acts on whatever the OS currently considers foreground, which can shift unexpectedly (e.g. launch_app on an already-running single-instance app activates its existing window instead of opening a new one) — this targets the exact window by handle regardless of what currently has focus."),
+			mcp.WithDescription("Close a specific window by title substring or hwnd (WM_CLOSE — the app's own \"save changes?\" prompt still fires; follow with confirm_dialogs to auto-handle it). Prefer over key(\"alt+f4\") when you know the target: alt+f4 hits whatever is currently foreground, this targets the exact window by handle."),
 			mcp.WithString("window", mcp.Description("Target window: title substring or hwnd."), mcp.Required()),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -297,20 +355,35 @@ func RunMCPScreen() error {
 	)
 
 	// screenshot — capture the full virtual screen and return it as an image so
-	// Claude's vision can read it. Optional 'scale' (0.1–1.0) downscales output.
+	// Claude's vision can read it. By DEFAULT the image is downscaled so its longer
+	// edge is at most maxScreenshotLongEdge px, which bounds the per-screenshot
+	// vision-token cost (Claude already downscales anything over ~1568px, so an
+	// uncapped grab costs the same ~1800 tokens regardless of monitor size). Pass
+	// scale=1.0 to force full resolution, or an explicit 0.1–1.0 factor.
 	s.AddTool(
 		mcp.NewTool("screenshot",
-			mcp.WithDescription("Capture the entire screen and return it as a PNG image. Use this to see what is currently on screen. Optional 'scale' (0.1–1.0) downscales the image to save tokens."),
+			mcp.WithDescription(fmt.Sprintf("Capture the entire screen and return it as a PNG image. Use this to see what is currently on screen. To SAVE TOKENS the image is downscaled by default to at most %dpx on its longer edge (readable, and clicking is unaffected — click coordinates come from win_controls/snapshot, not this image). Pass scale=1.0 for full resolution, or an explicit 0.1–1.0 downscale factor.", maxScreenshotLongEdge)),
 			mcp.WithNumber("scale",
-				mcp.Description("Optional downscale factor between 0.1 and 1.0. Omit or 1.0 for full resolution."),
+				mcp.Description("Optional downscale factor between 0.1 and 1.0. Omit for the default token-saving downscale; pass 1.0 for full resolution."),
 			),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			scale := req.GetFloat("scale", 1.0)
+			// scale omitted → default capped capture (token-bounded). scale given →
+			// honor it exactly (1.0 = full resolution). GetFloat returns 0 when the
+			// arg is absent, which we treat as "use the default cap".
+			scale := req.GetFloat("scale", 0)
 			if scale != 0 && (scale < 0.1 || scale > 1.0) {
 				return mcp.NewToolResultError("scale must be between 0.1 and 1.0"), nil
 			}
-			png, err := captureScreenScaled(scale)
+			var (
+				png []byte
+				err error
+			)
+			if scale == 0 {
+				png, err = captureScreenCapped(maxScreenshotLongEdge)
+			} else {
+				png, err = captureScreenScaled(scale)
+			}
 			if err != nil {
 				return mcp.NewToolResultErrorFromErr("screenshot failed", err), nil
 			}
@@ -324,22 +397,56 @@ func RunMCPScreen() error {
 	// returned caption gives the origin to map image pixels to screen coords.
 	s.AddTool(
 		mcp.NewTool("capture_window",
-			mcp.WithDescription("Capture ONLY the given window (cropped to its rectangle) as a PNG. Prefer this over the full screenshot: a single window is usually small enough to avoid vision downscaling, so it is sharp and its pixels map exactly to screen coordinates. The caption reports the window's screen origin so an in-image pixel (ix,iy) maps to click(x=left+ix, y=top+iy)."),
+			mcp.WithDescription(fmt.Sprintf("Capture ONLY the given window (cropped to its rectangle) as a PNG. Prefer this over the full screenshot. A window under %dpx on its longer edge comes back untouched — sharp, and its pixels map exactly to screen coordinates, so the caption gives the origin and an in-image pixel (ix,iy) maps to click(x=left+ix, y=top+iy). A bigger window is capped to %dpx (the vision layer would downscale it anyway); the caption then says so and the click mapping does NOT hold. To READ content even more cheaply, pass scale (0.1–1.0) — reading only, do not compute clicks from it. Even a capped window still costs ~1800 vision tokens and is re-sent on every later request, so reach for snapshot/get_text first.", visionLongEdgeCap, visionLongEdgeCap)),
 			mcp.WithString("window", mcp.Description("Target window: title substring or hwnd."), mcp.Required()),
+			mcp.WithNumber("scale", mcp.Description(fmt.Sprintf("Optional downscale factor 0.1–1.0 for READING only (fewer vision tokens). Omit for the default %dpx long-edge cap; pass 1.0 to force the raw grab with exact click mapping.", visionLongEdgeCap))),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			window, err := req.RequireString("window")
 			if err != nil {
 				return mcp.NewToolResultError("missing required argument 'window'"), nil
 			}
+			scale := req.GetFloat("scale", 0)
+			if scale != 0 && (scale < 0.1 || scale > 1.0) {
+				return mcp.NewToolResultError("scale must be between 0.1 and 1.0"), nil
+			}
 			png, left, top, w, h, err := captureWindow(window)
 			if err != nil {
 				return mcp.NewToolResultErrorFromErr("capture_window failed", err), nil
 			}
-			b64 := base64.StdEncoding.EncodeToString(png)
+			// Full resolution (default): keep the exact 1:1 image→screen click mapping.
 			caption := fmt.Sprintf("Window %q. Screen origin (left=%d, top=%d), size %dx%d. "+
 				"To click an element at image pixel (ix,iy), call click(x=%d+ix, y=%d+iy).",
 				window, left, top, w, h, left, top)
+			switch {
+			case scale != 0 && scale < 1.0:
+				var iw, ih int
+				png, iw, ih, err = scaleReadingPNG(png, scale)
+				if err != nil {
+					return mcp.NewToolResultErrorFromErr("capture_window downscale failed", err), nil
+				}
+				// Downscaled: the 1:1 mapping no longer holds, so steer clicks to the
+				// reliable path instead of offering error-prone scaled arithmetic.
+				caption = fmt.Sprintf("Window %q, downscaled to %dx%d for reading (from %dx%d). "+
+					"Read-only: do NOT compute click coordinates from this image — use snapshot/win_controls, "+
+					"or re-capture without scale for pixel-accurate clicking.", window, iw, ih, w, h)
+			case scale == 0:
+				// Default: cap the long edge. scale=1.0 skips this and returns the raw grab.
+				var iw, ih int
+				var capped bool
+				png, iw, ih, capped, err = capVisionLongEdge(png)
+				if err != nil {
+					return mcp.NewToolResultErrorFromErr("capture_window cap failed", err), nil
+				}
+				if capped {
+					caption = fmt.Sprintf("Window %q, capped to %dx%d (from %dx%d) — past %dpx the vision layer "+
+						"downscales anyway, so the extra pixels only cost transcript bytes. "+
+						"The 1:1 click mapping does NOT hold here: take coordinates from snapshot/win_controls, "+
+						"capture_region a sub-rectangle for an exact-mapping image, or pass scale=1.0 for the raw grab.",
+						window, iw, ih, w, h, visionLongEdgeCap)
+				}
+			}
+			b64 := base64.StdEncoding.EncodeToString(png)
 			return mcp.NewToolResultImage(caption, b64, "image/png"), nil
 		},
 	)
@@ -349,12 +456,13 @@ func RunMCPScreen() error {
 	// given (which also switches to that window's virtual desktop first).
 	s.AddTool(
 		mcp.NewTool("capture_region",
-			mcp.WithDescription("Capture an arbitrary rectangle as a PNG — useful to zoom into just part of a screen or window. (x,y) is the top-left; width and height the size. By default (x,y) are ABSOLUTE screen pixels. If 'window' is given, (x,y) are RELATIVE to that window's top-left (and we switch to its virtual desktop first if needed). The caption reports the rectangle's absolute screen origin so an in-image pixel (ix,iy) maps to click(x=origin+ix, y=origin+iy)."),
+			mcp.WithDescription(fmt.Sprintf("Capture an arbitrary rectangle as a PNG — the cheapest way to look at just the part you need. (x,y) is the top-left; width/height the size. (x,y) are ABSOLUTE screen pixels, or RELATIVE to 'window' when given (switches to its desktop first). A rectangle under %dpx on its longer edge is returned untouched and the caption reports the absolute origin, so image pixel (ix,iy) maps to click(x=origin+ix, y=origin+iy); a bigger one is capped to %dpx and loses that mapping (the caption says so). Pass scale (0.1–1.0) to downscale further for READING only, or scale=1.0 to force the raw grab.", visionLongEdgeCap, visionLongEdgeCap)),
 			mcp.WithNumber("x", mcp.Description("Left of the rectangle: absolute screen X, or window-relative X if 'window' is set."), mcp.Required()),
 			mcp.WithNumber("y", mcp.Description("Top of the rectangle: absolute screen Y, or window-relative Y if 'window' is set."), mcp.Required()),
 			mcp.WithNumber("width", mcp.Description("Rectangle width in pixels (>0)."), mcp.Required()),
 			mcp.WithNumber("height", mcp.Description("Rectangle height in pixels (>0)."), mcp.Required()),
 			mcp.WithString("window", mcp.Description("Optional target window (title substring or hwnd). When set, x/y are relative to this window's top-left.")),
+			mcp.WithNumber("scale", mcp.Description(fmt.Sprintf("Optional downscale factor 0.1–1.0 for READING only (fewer vision tokens). Omit for the default %dpx long-edge cap; pass 1.0 to force the raw grab with exact click mapping.", visionLongEdgeCap))),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			x, err := req.RequireInt("x")
@@ -374,11 +482,14 @@ func RunMCPScreen() error {
 				return mcp.NewToolResultError("missing required argument 'height'"), nil
 			}
 			window := req.GetString("window", "")
+			scale := req.GetFloat("scale", 0)
+			if scale != 0 && (scale < 0.1 || scale > 1.0) {
+				return mcp.NewToolResultError("scale must be between 0.1 and 1.0"), nil
+			}
 			png, absX, absY, err := captureRegionAt(window, x, y, w, h)
 			if err != nil {
 				return mcp.NewToolResultErrorFromErr("capture_region failed", err), nil
 			}
-			b64 := base64.StdEncoding.EncodeToString(png)
 			var caption string
 			if strings.TrimSpace(window) != "" {
 				caption = fmt.Sprintf("Region of window %q at window-relative (%d,%d), size %dx%d — screen origin (%d,%d). "+
@@ -387,6 +498,35 @@ func RunMCPScreen() error {
 				caption = fmt.Sprintf("Screen region at (%d,%d), size %dx%d. "+
 					"To click image pixel (ix,iy), call click(x=%d+ix, y=%d+iy).", absX, absY, w, h, absX, absY)
 			}
+			// Downscaled: same rule as capture_window — the 1:1 image→screen mapping is
+			// gone, so send clicks back through the reliable path instead of scaled math.
+			switch {
+			case scale != 0 && scale < 1.0:
+				var iw, ih int
+				png, iw, ih, err = scaleReadingPNG(png, scale)
+				if err != nil {
+					return mcp.NewToolResultErrorFromErr("capture_region downscale failed", err), nil
+				}
+				caption = fmt.Sprintf("Region at screen origin (%d,%d), downscaled to %dx%d for reading (from %dx%d). "+
+					"Read-only: do NOT compute click coordinates from this image — use snapshot/win_controls, "+
+					"or re-capture without scale for pixel-accurate clicking.", absX, absY, iw, ih, w, h)
+			case scale == 0:
+				// Default: cap the long edge. scale=1.0 skips this and returns the raw grab.
+				var iw, ih int
+				var capped bool
+				png, iw, ih, capped, err = capVisionLongEdge(png)
+				if err != nil {
+					return mcp.NewToolResultErrorFromErr("capture_region cap failed", err), nil
+				}
+				if capped {
+					caption = fmt.Sprintf("Region at screen origin (%d,%d), capped to %dx%d (from %dx%d) — past %dpx the "+
+						"vision layer downscales anyway, so the extra pixels only cost transcript bytes. "+
+						"The 1:1 click mapping does NOT hold here: take coordinates from snapshot/win_controls, "+
+						"re-capture a smaller rectangle for an exact-mapping image, or pass scale=1.0 for the raw grab.",
+						absX, absY, iw, ih, w, h, visionLongEdgeCap)
+				}
+			}
+			b64 := base64.StdEncoding.EncodeToString(png)
 			return mcp.NewToolResultImage(caption, b64, "image/png"), nil
 		},
 	)
@@ -398,7 +538,7 @@ func RunMCPScreen() error {
 	// docs/control-ownership.md §4.2. Does not acquire the lease.
 	s.AddTool(
 		mcp.NewTool("control_status",
-			mcp.WithDescription("Report who currently holds screen-control ownership across concurrent teleclaude sessions (each conversation runs its own aglink-screen process driving the same screen). Read-only: does NOT take control. Returns one of: 'control: free', 'control: held by me (...)', or 'control: held by another (owner_pid=.., ...)'. Use this before driving the screen to avoid colliding with another session; a control tool (click/type/...) will itself return a 'SCREEN_BUSY: ...' error if another session owns the screen."),
+			mcp.WithDescription("Report who holds screen-control ownership across concurrent sessions: 'control: free' / 'control: held by me (...)' / 'control: held by another (...)'. Read-only, does NOT take control. Check before driving the screen to avoid a SCREEN_BUSY collision (a click/type would otherwise return that error)."),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			return mcp.NewToolResultText(controlStatusText()), nil
@@ -711,9 +851,10 @@ func RunMCPScreen() error {
 	// more reliable than screenshot+vision for clicking by label.
 	s.AddTool(
 		mcp.NewTool("win_controls",
-			mcp.WithDescription("List a window's Win32 child controls with EXACT screen coordinates: 'class | \"label\" | center(x,y) | WxH'. Use the reported center as click(x,y), or use click_control to click by label. Works for native apps (buttons, SysTreeView32, SysListView32, Edit) even when snapshot/UIA returns nothing. By default only currently-visible controls are listed; set include_hidden=true to see controls on inactive panels/tabs."),
+			mcp.WithDescription("List a window's Win32 child controls with EXACT screen coordinates: 'class | \"label\" | center(x,y) | WxH'. Use the reported center as click(x,y), or click_control to click by label. Works for native apps even when snapshot/UIA is empty. Only visible controls unless include_hidden=true. Large trees are capped by 'max' (default 400)."),
 			mcp.WithString("window", mcp.Description("Target window: title substring or hwnd (e.g. 'NetGuard')."), mcp.Required()),
 			mcp.WithBoolean("include_hidden", mcp.Description("Include controls that are not currently visible (other tabs/panels). Default false.")),
+			mcp.WithNumber("max", mcp.Description("Max controls to return (default 400); a big list/tree is truncated with a note. Symmetry with snapshot's cap so a huge tree can't flood the prompt.")),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			window, err := req.RequireString("window")
@@ -721,12 +862,21 @@ func RunMCPScreen() error {
 				return mcp.NewToolResultError("missing required argument 'window'"), nil
 			}
 			includeHidden := req.GetBool("include_hidden", false)
+			maxControls := req.GetInt("max", 400)
 			ctrls, err := listControls(window, includeHidden)
 			if err != nil {
 				return mcp.NewToolResultErrorFromErr("win_controls failed", err), nil
 			}
 			if len(ctrls) == 0 {
 				return mcp.NewToolResultText("(no child controls found)"), nil
+			}
+			// Cap the count so a SysListView32/SysTreeView32 with thousands of rows
+			// can't dump its whole tree into the prompt. snapshot already caps its
+			// element count; this closes the same gap for win_controls.
+			note := ""
+			if maxControls > 0 && len(ctrls) > maxControls {
+				note = fmt.Sprintf("\n… [%d of %d controls shown; raise 'max' or narrow the window]", maxControls, len(ctrls))
+				ctrls = ctrls[:maxControls]
 			}
 			var b strings.Builder
 			for _, c := range ctrls {
@@ -738,7 +888,7 @@ func RunMCPScreen() error {
 					c.Class, c.Text, c.CenterX(), c.CenterY(),
 					c.Right-c.Left, c.Bottom-c.Top, vis)
 			}
-			return mcp.NewToolResultText(strings.TrimRight(b.String(), "\n")), nil
+			return mcp.NewToolResultText(strings.TrimRight(b.String(), "\n") + note), nil
 		},
 	)
 
@@ -803,7 +953,7 @@ func RunMCPScreen() error {
 	// snapshot — read the foreground window's UIA element tree as text.
 	s.AddTool(
 		mcp.NewTool("snapshot",
-			mcp.WithDescription("Read the foreground window's UI Automation element tree as compact text: control type, name, automation id, and capabilities ([invokable]/[editable]/[disabled]). Prefer this over screenshot — it is cheap and reliable for native apps. Optional 'max' caps the number of elements (default 200)."),
+			mcp.WithDescription("Read the foreground window's UI Automation element tree as compact text: control type, name, automation id, capabilities ([invokable]/[editable]/[text]/[disabled]), and a short inlined content preview (= \"…\") for fields/editors that carry text. Prefer this over a screenshot — it is cheap and reliable for native apps and shows both structure AND a content preview in one call. For the FULL text of an element or document, follow up with get_text (or get_value for a single field). Optional 'max' caps the number of elements (default 200)."),
 			mcp.WithNumber("max",
 				mcp.Description("Maximum number of elements to return (default 200)."),
 			),
@@ -921,6 +1071,32 @@ func RunMCPScreen() error {
 		},
 	)
 
+	// get_text — read a control's (or the whole foreground window's) textual
+	// content by handle, so a worker reads documents/editors/read-only panes as
+	// TEXT instead of capturing them as a screenshot (10–100× cheaper, exact, and
+	// not re-billed every turn as a retained image). Uses the UIA Text pattern with
+	// a Value fallback — the read path for content-heavy controls that snapshot
+	// only previews and get_value (Value-only) used to reject.
+	s.AddTool(
+		mcp.NewTool("get_text",
+			mcp.WithDescription(fmt.Sprintf("Read a window/control's full TEXT content by handle (UIA Text pattern, Value fallback) — use this to READ a document, editor, log pane, article, or read-only text area instead of a screenshot. Give 'name' (element Name/AutomationId from snapshot) to read one element; omit it to read the foreground window's document text. Returns up to %d chars (bounded). Prefer this and snapshot over capture_window for reading text; capture only for genuinely visual content.", maxTextChars)),
+			mcp.WithString("name",
+				mcp.Description("Optional element Name/AutomationId to read. Omit to read the foreground window's own text content."),
+			),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			name := req.GetString("name", "")
+			text, err := uiaGetText(name)
+			if err != nil {
+				return mcp.NewToolResultErrorFromErr("get_text failed", err), nil
+			}
+			if strings.TrimSpace(text) == "" {
+				return mcp.NewToolResultText("(no text content)"), nil
+			}
+			return mcp.NewToolResultText(text), nil
+		},
+	)
+
 	// ---- batch execution ----
 
 	// run_sequence — execute several actions in one call instead of one
@@ -935,7 +1111,7 @@ func RunMCPScreen() error {
 	// or may not appear) belong outside the batch, split at that point.
 	s.AddTool(
 		mcp.NewTool("run_sequence",
-			mcp.WithDescription(`Execute a batch of screen actions in one call instead of one tool round-trip per step. Supported actions (same params as each action's own tool): click{x,y,button?,modifiers?}, double_click{x,y}, triple_click{x,y}, type{text}, key{combo,hold_ms?}, invoke{name}, set_value{name,text}, click_control{window,text,nth?}, wait_for_control{name,timeout_ms?}, wait_for_window{window,timeout_ms?}, scroll{dx?,dy?}, drag{x,y,x2,y2,button?}. Stops at the first failed step and reports exactly how far it got (never silently partial). Use this ONLY for a sequence whose targets you already know (e.g. from a prior snapshot) — a step that depends on reacting to something unpredictable (a popup that may or may not appear) belongs outside the batch; split the sequence there and inspect state before continuing. Deliberately exclude a final destructive/committing action (send, delete, confirm) from the batch — verify state after the batch completes, then issue that as its own separate call.`),
+			mcp.WithDescription(`Execute a batch of screen actions in one call instead of one round-trip per step. Actions (same params as each own tool): click{x,y,button?,modifiers?}, double_click{x,y}, triple_click{x,y}, type{text}, key{combo,hold_ms?}, invoke{name}, set_value{name,text}, click_control{window,text,nth?}, wait_for_control{name,timeout_ms?}, wait_for_window{window,timeout_ms?}, scroll{dx?,dy?}, drag{x,y,x2,y2,button?}. Stops at the first failed step and reports how far it got. Use only for steps whose targets you already know; keep any final destructive/committing action (send, delete, confirm) out of the batch and issue it separately after verifying state.`),
 			mcp.WithString("steps", mcp.Description(`JSON array of step objects, each with an "action" field plus that action's params. Example: [{"action":"click","x":100,"y":200},{"action":"type","text":"hello"},{"action":"key","combo":"tab"}]`), mcp.Required()),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -944,7 +1120,9 @@ func RunMCPScreen() error {
 				return mcp.NewToolResultError("missing required argument 'steps'"), nil
 			}
 			results, rerr := runSequence(stepsJSON)
-			b, _ := json.MarshalIndent(results, "", "  ")
+			// Compact (not indented) JSON: this is machine-read step output, so the
+			// pretty-print newlines/spaces were pure token overhead every call.
+			b, _ := json.Marshal(results)
 			if rerr != nil {
 				return mcp.NewToolResultError(fmt.Sprintf("run_sequence stopped early: %v\n%s", rerr, string(b))), nil
 			}
